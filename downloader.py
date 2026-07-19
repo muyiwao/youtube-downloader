@@ -20,7 +20,7 @@ import yt_dlp
 from yt_dlp.utils import download_range_func
 
 CONCURRENT_FRAGMENTS = 4
-PARALLEL_DOWNLOADS = 2
+PARALLEL_DOWNLOADS = 2  # Different URLs only; jobs for one URL run sequentially.
 MAX_BATCH_JOBS = 10
 SOCKET_TIMEOUT_SECONDS = 30
 DOWNLOAD_RETRIES = 5
@@ -31,6 +31,75 @@ LogCallback = Callable[[str], None]
 
 VALID_DOWNLOAD_TYPES = {"video", "silent", "audio", "thumbnail"}
 VALID_SCOPES = {"full", "segment"}
+
+
+class YtDlpJobLogger:
+    """Capture yt-dlp diagnostics so web users receive useful errors."""
+
+    def __init__(self, job_number: int, callback: LogCallback | None) -> None:
+        self.job_number = job_number
+        self.callback = callback
+        self.messages: list[str] = []
+
+    def _record(self, level: str, message: str) -> None:
+        clean = str(message or "").strip()
+        if not clean:
+            return
+        self.messages.append(clean)
+        # Keep the Streamlit status area concise.
+        if level in {"warning", "error"}:
+            _log(f"Job {self.job_number}: {clean}", self.callback)
+
+    def debug(self, message: str) -> None:
+        # yt-dlp sometimes sends informational output through debug().
+        if str(message).startswith("[debug]"):
+            return
+
+    def info(self, message: str) -> None:
+        return
+
+    def warning(self, message: str) -> None:
+        self._record("warning", message)
+
+    def error(self, message: str) -> None:
+        self._record("error", message)
+
+    def best_error(self, fallback: BaseException | None = None) -> str:
+        for message in reversed(self.messages):
+            if message:
+                return normalise_download_error(message)
+        fallback_text = str(fallback or "").strip()
+        return normalise_download_error(fallback_text or "Unknown yt-dlp failure.")
+
+
+def normalise_download_error(message: str) -> str:
+    """Convert low-level yt-dlp failures into clear web-app messages."""
+    clean = re.sub(r"\x1b\[[0-9;]*m", "", str(message)).strip()
+    clean = re.sub(r"^ERROR:\s*", "", clean, flags=re.IGNORECASE)
+    lower = clean.lower()
+
+    if "sign in to confirm" in lower or "not a bot" in lower:
+        return (
+            "YouTube rejected the Streamlit Cloud server IP and requested "
+            "human verification. This is a hosting/network restriction, not "
+            "a timestamp error. Try again later or run the app locally."
+        )
+    if "requested format is not available" in lower:
+        return (
+            "The requested MP4 format is unavailable for this video. "
+            "Update yt-dlp or try another output type."
+        )
+    if "http error 403" in lower or "403 forbidden" in lower:
+        return (
+            "The media server returned HTTP 403. The cloud IP or selected "
+            "stream was refused. Try again later or run the app locally."
+        )
+    if "js runtime" in lower or "javascript runtime" in lower or "challenge solver" in lower:
+        return (
+            "YouTube's JavaScript challenge could not be solved. Confirm that "
+            "yt-dlp[default] and a supported JavaScript runtime are installed."
+        )
+    return clean or "Unknown yt-dlp failure."
 
 
 def parse_urls(raw_urls: str) -> list[str]:
@@ -213,6 +282,13 @@ def build_common_options(job: dict[str, Any], output_dir: Path) -> dict[str, Any
         "noplaylist": True,
         "quiet": True,
         "no_warnings": False,
+        "ignoreerrors": False,
+        # Node is installed through packages.txt. It is not enabled by default
+        # by current yt-dlp releases, so enable it explicitly.
+        "js_runtimes": {"node": {}},
+        # Permit yt-dlp to obtain its official EJS challenge scripts when the
+        # matching Python package is temporarily unavailable or stale.
+        "remote_components": {"ejs:github"},
         "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
         "continuedl": True,
         "nopart": False,
@@ -292,12 +368,30 @@ def download_job(
     job_number = job["job_number"]
     _log(f"Job {job_number}: starting", log_callback)
 
-    options = build_download_options(job, output_dir)
+    # Isolate each job completely. This prevents fragments and temporary files
+    # from multiple segments of the same video affecting one another.
+    job_output_dir = output_dir / f"job-{job_number:03d}"
+    job_output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = YtDlpJobLogger(job_number, log_callback)
+    options = build_download_options(job, job_output_dir)
+    options["logger"] = logger
+
     try:
         with yt_dlp.YoutubeDL(options) as downloader:
             result_code = downloader.download([job["url"]])
         if result_code != 0:
             raise RuntimeError(f"yt-dlp returned exit code {result_code}")
+
+        produced_files = [
+            path for path in job_output_dir.rglob("*")
+            if path.is_file()
+            and path.suffix not in {".part", ".ytdl"}
+            and not path.name.endswith(".temp")
+        ]
+        if not produced_files:
+            raise RuntimeError("yt-dlp completed without producing an output file.")
+
         _log(f"Job {job_number}: completed", log_callback)
         return {
             "job_number": job_number,
@@ -307,13 +401,14 @@ def download_job(
             "error": None,
         }
     except Exception as exc:  # yt-dlp raises extractor-specific exceptions.
-        _log(f"Job {job_number}: failed - {exc}", log_callback)
+        error_message = logger.best_error(exc)
+        _log(f"Job {job_number}: failed - {error_message}", log_callback)
         return {
             "job_number": job_number,
             "url": job["url"],
             "download_type": job["download_type"],
             "success": False,
-            "error": str(exc),
+            "error": error_message,
         }
 
 
@@ -322,31 +417,50 @@ def run_jobs(
     output_dir: Path,
     log_callback: LogCallback | None = None,
 ) -> list[dict[str, Any]]:
-    """Run independent jobs concurrently, up to PARALLEL_DOWNLOADS workers."""
-    worker_count = min(PARALLEL_DOWNLOADS, len(jobs))
+    """Run different URLs concurrently but serialize jobs for the same URL.
+
+    Four segments from one YouTube video therefore reuse a conservative access
+    pattern instead of opening several simultaneous requests to that video.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for job in jobs:
+        grouped.setdefault(job["url"], []).append(job)
+
+    def run_url_group(url_jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            download_job(job, output_dir, log_callback)
+            for job in url_jobs
+        ]
+
+    worker_count = min(PARALLEL_DOWNLOADS, len(grouped))
     if worker_count <= 1:
-        return [download_job(job, output_dir, log_callback) for job in jobs]
+        results = []
+        for url_jobs in grouped.values():
+            results.extend(run_url_group(url_jobs))
+        return sorted(results, key=lambda item: item["job_number"])
 
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = {
-            executor.submit(download_job, job, output_dir, log_callback): job
-            for job in jobs
+            executor.submit(run_url_group, url_jobs): url
+            for url, url_jobs in grouped.items()
         }
         for future in as_completed(futures):
-            job = futures[future]
             try:
-                results.append(future.result())
+                results.extend(future.result())
             except Exception as exc:
-                results.append(
-                    {
+                # This should be rare because download_job handles job-level
+                # failures, but preserve a useful group-level diagnostic.
+                url = futures[future]
+                for job in grouped[url]:
+                    results.append({
                         "job_number": job["job_number"],
                         "url": job["url"],
                         "download_type": job["download_type"],
                         "success": False,
-                        "error": str(exc),
-                    }
-                )
+                        "error": normalise_download_error(str(exc)),
+                    })
+
     return sorted(results, key=lambda item: item["job_number"])
 
 
@@ -363,13 +477,15 @@ def create_batch_download_archive(
     results = run_jobs(jobs, output_dir, log_callback)
     files = [
         path
-        for path in output_dir.iterdir()
-        if path.is_file() and path.suffix != ".part"
+        for path in output_dir.rglob("*")
+        if path.is_file()
+        and path.suffix not in {".part", ".ytdl"}
+        and not path.name.endswith(".temp")
     ]
 
     if not files:
         errors = "; ".join(
-            result["error"] or "unknown error"
+            str(result.get("error") or "Job failed without a diagnostic.")
             for result in results
             if not result["success"]
         )
@@ -383,7 +499,7 @@ def create_batch_download_archive(
         compression=zipfile.ZIP_DEFLATED,
     ) as archive:
         for path in files:
-            archive.write(path, arcname=path.name)
+            archive.write(path, arcname=str(path.relative_to(output_dir)))
 
     return archive_path, results, session_dir
 
