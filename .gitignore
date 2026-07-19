@@ -21,3 +21,6 @@ runtime/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Downloaded JavaScript runtime
+runtime_tools/
