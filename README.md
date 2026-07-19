@@ -61,3 +61,24 @@ youtube-downloader-streamlit/
 ## Important hosting limitation
 
 A successful local test does not guarantee that every media site will work from Community Cloud. Sites can block cloud-hosting IP addresses, require cookies, alter extraction logic, or impose rate limits. Free Streamlit resources are also unsuitable for long or highly concurrent downloads.
+
+## Batch input methods
+
+The advanced batch page supports both input methods:
+
+1. **Manual entry**: add or remove rows directly in the editable table.
+2. **CSV import**: upload a UTF-8 CSV and select **Load CSV into table**.
+3. **Combined input**: load CSV rows, then edit them or append additional manual rows.
+
+Use the downloadable template in the app or `sample_batch.csv` in this repository.
+
+Required CSV structure:
+
+```csv
+url,download_type,scope,start,end
+https://www.youtube.com/watch?v=EXAMPLE1,video,full,,
+https://www.youtube.com/watch?v=EXAMPLE2,video,segment,00:00:10,00:00:30
+```
+
+Accepted `download_type` values are `video`, `silent`, `audio`, and `thumbnail`.
+Accepted `scope` values are `full` and `segment`. Start and end timestamps are required only for segment jobs.

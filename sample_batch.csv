@@ -1,0 +1,5 @@
+url,download_type,scope,start,end
+https://www.youtube.com/watch?v=EXAMPLE1,video,full,,
+https://www.youtube.com/watch?v=EXAMPLE2,video,segment,00:00:10,00:00:30
+https://www.youtube.com/watch?v=EXAMPLE3,audio,segment,00:01:00,00:02:00
+https://www.youtube.com/watch?v=EXAMPLE4,thumbnail,full,,
